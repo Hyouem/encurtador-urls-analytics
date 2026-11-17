@@ -1,0 +1,80 @@
+name: Java CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_DB: shortener
+          POSTGRES_USER: shortener
+          POSTGRES_PASSWORD: shortener
+        ports: ['15434:5432']
+        options: >-
+          --health-cmd "pg_isready -U shortener -d shortener"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+      redis:
+        image: redis:7
+        ports: ['16379:6379']
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+          cache: maven
+      - name: Verify
+        run: mvn -B clean verify
+      - name: HTTP smoke test
+        env:
+          DB_URL: jdbc:postgresql://localhost:15434/shortener
+          DB_USER: shortener
+          DB_PASSWORD: shortener
+          REDIS_HOST: localhost
+          REDIS_PORT: '16379'
+        shell: bash
+        run: |
+          java -jar target/encurtador-urls-analytics-1.0.0.jar --server.port=18081 > /tmp/shortener.log 2>&1 &
+          PID=$!
+          trap 'kill "$PID" 2>/dev/null || true; cat /tmp/shortener.log' EXIT
+          ready=0
+          for i in $(seq 1 90); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:18081/api/links/nonexistent-ci)
+            if [ "$code" = '404' ]; then ready=1; break; fi
+            sleep 1
+          done
+          test "$ready" = 1
+          python3 - <<'PY'
+          import json, urllib.request, urllib.error, uuid
+          base='http://127.0.0.1:18081'
+          alias='ci'+uuid.uuid4().hex[:12]
+          class NoRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, req, fp, code, msg, headers, newurl): return None
+          opener=urllib.request.build_opener(NoRedirect)
+          def req(path, method='GET', data=None, key=None):
+              headers={}
+              if data is not None: headers['Content-Type']='application/json'
+              if key is not None: headers['X-Management-Key']=key
+              request=urllib.request.Request(base+path, data=(json.dumps(data).encode() if data is not None else None),headers=headers,method=method)
+              try:
+                  with opener.open(request) as r: return r.status,r.read()
+              except urllib.error.HTTPError as e: return e.code,e.read()
+          status,body=req('/api/links','POST',{'url':'https://example.com','alias':alias})
+          assert status==201,(status,body)
+          key=json.loads(body)['managementKey']
+          assert req('/api/links/'+alias)[0]==200
+          assert req('/api/links/'+alias,'DELETE')[0]==403
+          assert req('/'+alias)[0]==302
+          assert json.loads(req('/api/links/'+alias+'/analytics')[1])['totalClicks']==1
+          assert req('/api/links/'+alias,'DELETE',key=key)[0]==204
+          assert req('/'+alias)[0]==410
+          print('HTTP smoke OK: 201/200/403/302/204/410')
+          PY

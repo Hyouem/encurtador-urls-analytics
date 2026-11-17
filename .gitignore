@@ -1,0 +1,13 @@
+/target/
+/logs/
+/.idea/
+/.settings/
+/.classpath
+/.project
+/.env
+/.env.*
+!.env.example
+*.iml
+*.log
+*.jar
+*.original
